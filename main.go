@@ -2,12 +2,23 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
+	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+)
+
+// Object types
+const (
+	OBJ_COMMIT    = 1
+	OBJ_TREE      = 2
+	OBJ_BLOB      = 3
+	OBJ_TAG       = 4
+	OBJ_OFS_DELTA = 6
+	OBJ_REF_DELTA = 7
 )
 
 func getMainHash(URL string) (string, error) {
@@ -52,7 +63,7 @@ func getPackfile(URL string) ([]byte, error) {
 	if err != nil {
 		return []byte{}, fmt.Errorf("ERROR from http.NewRequest: %v", err)
 	}
-	req.Header.Set("Content-Type", "x-git-upload-pack-request")
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -66,18 +77,106 @@ func getPackfile(URL string) ([]byte, error) {
 		return []byte{}, fmt.Errorf("ERROR from io.ReadAll: %v", err)
 	}
 
-	// expected response:
-	// 0008NAK\nPACK...
-	if len(body) < 12 {
-		return nil, fmt.Errorf("response too short: %d bytes", len(body))
+	if len(body) < 8 {
+		return nil, fmt.Errorf("response body too short: %d bytes", len(body))
 	}
 	if string(body[4:7]) != "NAK" {
 		return nil, fmt.Errorf("missing NAK, got %q", body[4:7])
 	}
-	if string(body[8:12]) != "PACK" {
-		return nil, fmt.Errorf("missing PACK, got %q", body[8:12])
+	return body[8:], nil
+}
+
+func getObjectsCount(pack []byte) (uint32, error) {
+	if len(pack) < 12 {
+		return 0, fmt.Errorf("packfile too short: %d bytes", len(pack))
 	}
-	return body[12:], nil
+	if string(pack[:4]) != "PACK" {
+		return 0, fmt.Errorf(" Bad packfile format: missing 'PACK' in header")
+	}
+	return binary.BigEndian.Uint32(pack[8:12]), nil
+}
+
+func verifyChecksum(pack []byte) bool {
+	packLen := len(pack)
+	if packLen < 20 {
+		return false
+	}
+	expectedChecksum := pack[packLen-20:]
+
+	hash := sha1.New()
+	hash.Write(pack[:packLen-20])
+	calculatedChecksum := hash.Sum(nil)
+
+	return bytes.Equal(expectedChecksum, calculatedChecksum)
+}
+
+func parseVarInt(pack []byte, start int) {
+
+}
+
+func parsePackfile(pack []byte) error {
+	if !verifyChecksum(pack) {
+		return fmt.Errorf("Checksum verification failed")
+	}
+
+	objsCount, err := getObjectsCount(pack)
+	if err != nil {
+		return err
+	}
+
+	// skip pack header and checksum
+	pack = pack[12 : len(pack)-20]
+
+	off := 0
+	for i := uint32(0); i < objsCount; i++ {
+		byt := pack[off]
+		off++
+
+		objType := (byt >> 4) & 0x7
+		if objType > 7 || objType < 1 || objType == 5 {
+			return fmt.Errorf("Bad object type in the packfile: %d", objType)
+		}
+
+		objSize := uint64(byt & 0xF)
+		shift := 4
+
+		fmt.Printf("%x\n", byt)
+
+		if ((byt >> 4) & 0x8) == 1 {
+			for {
+				byt := pack[off]
+				fmt.Printf("%x\n", byt)
+				off++
+
+				objSize += uint64((byt & 0x7F) << shift)
+				shift += 7
+
+				if ((byt >> 7) & 0x8) != 0 {
+					break
+				}
+			}
+		}
+
+		fmt.Println(objType, objSize)
+
+		break
+	}
+
+	return nil
+}
+
+func writeToFile(data []byte) error {
+	file, err := os.OpenFile("commit.pack", os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	_, err = file.Write(data)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func main() {
@@ -85,10 +184,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s <repo-url>\n", os.Args[0])
 		os.Exit(1)
 	}
+
 	URL := os.Args[1]
 	pack, err := getPackfile(URL)
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Println(hex.Dump(pack))
+
+	fmt.Println(parsePackfile(pack))
 }
