@@ -140,18 +140,15 @@ func parsePackfile(pack []byte) error {
 		objSize := uint64(byt & 0xF)
 		shift := 4
 
-		fmt.Printf("%x\n", byt)
-
-		if ((byt >> 4) & 0x8) == 1 {
+		if (byt & 0x80) != 0 {
 			for {
-				byt := pack[off]
-				fmt.Printf("%x\n", byt)
+				byt = pack[off]
 				off++
 
-				objSize += uint64((byt & 0x7F) << shift)
+				objSize += uint64((uint64(byt & 0x7F)) << shift)
 				shift += 7
 
-				if ((byt >> 7) & 0x8) != 0 {
+				if (byt & 0x80) == 0 {
 					break
 				}
 			}
