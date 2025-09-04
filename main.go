@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -110,10 +111,6 @@ func verifyChecksum(pack []byte) bool {
 	return bytes.Equal(expectedChecksum, calculatedChecksum)
 }
 
-func parseVarInt(pack []byte, start int) {
-
-}
-
 func parsePackfile(pack []byte) error {
 	if !verifyChecksum(pack) {
 		return fmt.Errorf("Checksum verification failed")
@@ -127,25 +124,44 @@ func parsePackfile(pack []byte) error {
 	// skip pack header and checksum
 	pack = pack[12 : len(pack)-20]
 
-	off := 0
+	off := int64(0)
 	for i := uint32(0); i < objsCount; i++ {
+		if off >= int64(len(pack)) {
+			return fmt.Errorf(
+				"unexpected end of packfile at offset %d",
+				off,
+			)
+		}
+
 		byt := pack[off]
 		off++
 
 		objType := (byt >> 4) & 0x7
-		if objType > 7 || objType < 1 || objType == 5 {
+		if objType >= 7 || objType <= 0 || objType == 5 {
 			return fmt.Errorf("Bad object type in the packfile: %d", objType)
 		}
 
-		objSize := uint64(byt & 0xF)
+		objSize := int64(byt & 0xF)
 		shift := 4
 
 		if (byt & 0x80) != 0 {
 			for {
+				if off >= int64(len(pack)) {
+					return fmt.Errorf(
+						"unexpected end of packfile at offset %d",
+						off,
+					)
+				}
 				byt = pack[off]
 				off++
 
-				objSize += uint64((uint64(byt & 0x7F)) << shift)
+				if shift > 60 {
+					return fmt.Errorf(
+						"object size encoding too large at offset %d",
+						off-1,
+					)
+				}
+				objSize += int64((int64(byt & 0x7F)) << shift)
 				shift += 7
 
 				if (byt & 0x80) == 0 {
@@ -154,9 +170,31 @@ func parsePackfile(pack []byte) error {
 			}
 		}
 
-		fmt.Println(objType, objSize)
+		if objType == OBJ_REF_DELTA {
+			off += 20
+		}
 
-		break
+		bytesReader := bytes.NewReader(pack[off:])
+		zlibReader, err := zlib.NewReader(bytesReader)
+		if err != nil {
+			return fmt.Errorf("zlib.NewReader has failed: %v", err)
+		}
+
+		raw, err := io.ReadAll(zlibReader)
+		zlibReader.Close()
+		if err != nil {
+			return fmt.Errorf("io.ReadAll has failed: %v", err)
+		}
+
+		if int64(len(raw)) != objSize {
+			return fmt.Errorf(
+				"object size mismatch: expected %d bytes, got %d bytes",
+				objSize, len(raw),
+			)
+		}
+
+		// Move offset by the compressed data size (difference before and after)
+		off += bytesReader.Size() - int64(bytesReader.Len())
 	}
 
 	return nil
