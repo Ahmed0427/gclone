@@ -5,14 +5,16 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
-// Object types
+// all object types
 const (
 	OBJ_COMMIT    = 1
 	OBJ_TREE      = 2
@@ -22,8 +24,16 @@ const (
 	OBJ_REF_DELTA = 7
 )
 
-func getMainHash(URL string) (string, error) {
-	refsURL := fmt.Sprintf("%s/info/refs?service=git-upload-pack", URL)
+// all object types i need
+var objTypeNames = map[byte]string{
+	OBJ_COMMIT:    "commit",
+	OBJ_TREE:      "tree",
+	OBJ_BLOB:      "blob",
+	OBJ_REF_DELTA: "ref_delta",
+}
+
+func getMainHash(repoURL string) (string, error) {
+	refsURL := fmt.Sprintf("%s/info/refs?service=git-upload-pack", repoURL)
 
 	resp, err := http.Get(refsURL)
 	if err != nil {
@@ -51,13 +61,13 @@ func getMainHash(URL string) (string, error) {
 	return "", fmt.Errorf("main branch ref not found")
 }
 
-func getPackfile(URL string) ([]byte, error) {
-	mainHash, err := getMainHash(URL)
+func getPackfile(repoURL string) ([]byte, error) {
+	mainHash, err := getMainHash(repoURL)
 	if err != nil {
 		return []byte{}, err
 	}
 
-	fetchURL := fmt.Sprintf("%s/git-upload-pack", URL)
+	fetchURL := fmt.Sprintf("%s/git-upload-pack", repoURL)
 	reqBody := []byte(fmt.Sprintf("0032want %s\n", mainHash) + "0000" + "0009done\n")
 
 	req, err := http.NewRequest("POST", fetchURL, bytes.NewBuffer(reqBody))
@@ -125,6 +135,7 @@ func parsePackfile(pack []byte) error {
 	pack = pack[12 : len(pack)-20]
 
 	off := int64(0)
+	counter := make(map[int]int)
 	for i := uint32(0); i < objsCount; i++ {
 		if off >= int64(len(pack)) {
 			return fmt.Errorf(
@@ -137,7 +148,7 @@ func parsePackfile(pack []byte) error {
 		off++
 
 		objType := (byt >> 4) & 0x7
-		if objType >= 7 || objType <= 0 || objType == 5 {
+		if _, ok := objTypeNames[objType]; !ok {
 			return fmt.Errorf("Bad object type in the packfile: %d", objType)
 		}
 
@@ -195,35 +206,75 @@ func parsePackfile(pack []byte) error {
 
 		// Move offset by the compressed data size (difference before and after)
 		off += bytesReader.Size() - int64(bytesReader.Len())
+
+		counter[int(objType)]++
+		if counter[int(objType)] == 1 {
+			fmt.Println("object type:", objTypeNames[objType])
+			fmt.Println(hex.Dump(raw))
+			fmt.Println()
+		}
+	}
+	fmt.Println(counter)
+
+	return nil
+}
+
+func changeDir(dirPath string) error {
+	err := os.MkdirAll(dirPath, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create %s: %w", dirPath, err)
+	}
+
+	err = os.Chdir(dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to change to %s: %w", dirPath, err)
 	}
 
 	return nil
 }
 
-func writeToFile(data []byte) error {
-	file, err := os.OpenFile("commit.pack", os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
+func initRepo(repo string, defaultBranch string) error {
+	gitDirs := []string{
+		".git",
+		".git/objects",
+		".git/refs",
+		".git/refs/heads",
 	}
 
-	_, err = file.Write(data)
-	if err != nil {
-		return err
+	for _, dir := range gitDirs {
+		fullPath := filepath.Join(repo, dir)
+		if err := os.MkdirAll(fullPath, 0755); err != nil {
+			return fmt.Errorf("failed to create %s: %w", fullPath, err)
+		}
+	}
+
+	headPath := filepath.Join(repo, ".git", "HEAD")
+	headContent := []byte(fmt.Sprintf("ref: refs/heads/%s\n", defaultBranch))
+	if err := os.WriteFile(headPath, headContent, 0644); err != nil {
+		return fmt.Errorf("failed to write HEAD file: %w", err)
 	}
 
 	return nil
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "%s <repo-url>\n", os.Args[0])
+	if len(os.Args) != 3 {
+		fmt.Fprintf(os.Stderr, "%s <repo_url> <dir_path>\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	URL := os.Args[1]
-	pack, err := getPackfile(URL)
+	repoURL := os.Args[1]
+	dirPath := os.Args[2]
+
+	if err := changeDir(dirPath); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	pack, err := getPackfile(repoURL)
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(1)
 	}
 
 	fmt.Println(parsePackfile(pack))
