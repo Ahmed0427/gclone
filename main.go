@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -30,6 +31,11 @@ var objTypeNames = map[byte]string{
 	OBJ_TREE:      "tree",
 	OBJ_BLOB:      "blob",
 	OBJ_REF_DELTA: "ref_delta",
+}
+
+type Delta struct {
+	hash string
+	data []byte
 }
 
 func getMainHash(repoURL string) (string, string, error) {
@@ -60,12 +66,18 @@ func getMainHash(repoURL string) (string, string, error) {
 			words := strings.Split(line, " ")
 			for _, w := range words {
 				if strings.Contains(w, "HEAD:refs/heads") {
-					defaultBranch = strings.Split(w, "/")[2]
+					parts := strings.Split(w, "/")
+					if len(parts) >= 3 {
+						defaultBranch = parts[2]
+					}
 				}
 			}
 		} else {
 			if strings.HasSuffix(line, fmt.Sprintf("refs/heads/%s", defaultBranch)) {
-				return strings.Fields(line)[0][4:], defaultBranch, nil
+				fields := strings.Fields(line)
+				if len(fields) > 0 && len(fields[0]) > 4 {
+					return fields[0][4:], defaultBranch, nil
+				}
 			}
 		}
 	}
@@ -120,6 +132,23 @@ func compressBytes(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func decompressBytes(data []byte) ([]byte, error) {
+	buf := bytes.NewReader(data)
+	r, err := zlib.NewReader(buf)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	var out bytes.Buffer
+	_, err = out.ReadFrom(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
 func writeObject(content []byte, objType string) error {
 	// The object format is:
 	// <type> <size>\0<content>
@@ -152,6 +181,52 @@ func writeObject(content []byte, objType string) error {
 	return nil
 }
 
+func readObject(hash string) ([]byte, string, error) {
+	// The object format is:
+	// <type> <size>\0<content>
+	objPath := filepath.Join(".git/objects", hash[:2], hash[2:])
+
+	objContent, err := os.ReadFile(objPath)
+	if err != nil {
+		return []byte{}, "", fmt.Errorf("failed to read obj: %w", err)
+	}
+
+	objContent, err = decompressBytes(objContent)
+	if err != nil {
+		return []byte{}, "", fmt.Errorf("failed to decompress object content: %w", err)
+	}
+
+	nullIdx := bytes.IndexByte(objContent, 0)
+	if nullIdx == -1 {
+		return []byte{}, "",
+			fmt.Errorf("failed to find null byte in object file: %s", objPath)
+	}
+
+	header := objContent[:nullIdx]
+	content := objContent[nullIdx+1:]
+
+	spaceIdx := bytes.IndexByte(header, byte(' '))
+	if spaceIdx == -1 {
+		return []byte{}, "",
+			fmt.Errorf("failed to find space byte in object file: %s", objPath)
+	}
+
+	objType := string(header[:spaceIdx])
+
+	size, err := strconv.Atoi(string(header[spaceIdx+1:]))
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid size in object header: %w", err)
+	}
+
+	if size != len(content) {
+		return nil, "",
+			fmt.Errorf("size mismatch: declared %d, got %d",
+				size, len(content))
+	}
+
+	return content, objType, nil
+}
+
 func getObjectsCount(pack []byte) (uint32, error) {
 	if len(pack) < 12 {
 		return 0, fmt.Errorf("packfile too short: %d bytes", len(pack))
@@ -176,23 +251,25 @@ func verifyChecksum(pack []byte) bool {
 	return bytes.Equal(expectedChecksum, calculatedChecksum)
 }
 
-func parsePackfile(pack []byte) error {
+func parsePackfile(pack []byte) ([]Delta, error) {
 	if !verifyChecksum(pack) {
-		return fmt.Errorf("Checksum verification failed")
+		return []Delta{}, fmt.Errorf("Checksum verification failed")
 	}
 
 	objsCount, err := getObjectsCount(pack)
 	if err != nil {
-		return err
+		return []Delta{}, err
 	}
 
 	// skip pack header and checksum
 	pack = pack[12 : len(pack)-20]
 
+	deltas := []Delta{}
+
 	off := int64(0)
 	for i := uint32(0); i < objsCount; i++ {
 		if off >= int64(len(pack)) {
-			return fmt.Errorf(
+			return []Delta{}, fmt.Errorf(
 				"unexpected end of packfile at offset %d",
 				off,
 			)
@@ -203,7 +280,7 @@ func parsePackfile(pack []byte) error {
 
 		objType := (byt >> 4) & 0x7
 		if _, ok := objTypeNames[objType]; !ok {
-			return fmt.Errorf("Bad object type in the packfile: %d", objType)
+			return []Delta{}, fmt.Errorf("Bad object type in the packfile: %d", objType)
 		}
 
 		objSize := int64(byt & 0xF)
@@ -212,7 +289,7 @@ func parsePackfile(pack []byte) error {
 		if (byt & 0x80) != 0 {
 			for {
 				if off >= int64(len(pack)) {
-					return fmt.Errorf(
+					return []Delta{}, fmt.Errorf(
 						"unexpected end of packfile at offset %d",
 						off,
 					)
@@ -221,12 +298,12 @@ func parsePackfile(pack []byte) error {
 				off++
 
 				if shift > 60 {
-					return fmt.Errorf(
+					return []Delta{}, fmt.Errorf(
 						"object size encoding too large at offset %d",
 						off-1,
 					)
 				}
-				objSize += int64((int64(byt & 0x7F)) << shift)
+				objSize |= int64((int64(byt & 0x7F)) << shift)
 				shift += 7
 
 				if (byt & 0x80) == 0 {
@@ -237,40 +314,115 @@ func parsePackfile(pack []byte) error {
 
 		refDeltaHash := []byte{}
 		if objType == OBJ_REF_DELTA {
+			if off+20 > int64(len(pack)) {
+				return []Delta{},
+					fmt.Errorf(
+						"unexpected end of packfile while reading ref delta hash",
+					)
+			}
 			refDeltaHash = pack[off : off+20]
 			off += 20
+		}
+
+		if off >= int64(len(pack)) {
+			return []Delta{}, fmt.Errorf(
+				"unexpected end of packfile at offset %d",
+				off,
+			)
 		}
 
 		bytesReader := bytes.NewReader(pack[off:])
 		zlibReader, err := zlib.NewReader(bytesReader)
 		if err != nil {
-			return fmt.Errorf("zlib.NewReader has failed: %v", err)
+			return []Delta{}, fmt.Errorf("zlib.NewReader has failed: %v", err)
 		}
 
 		raw, err := io.ReadAll(zlibReader)
 		zlibReader.Close()
 		if err != nil {
-			return fmt.Errorf("io.ReadAll has failed: %v", err)
+			return []Delta{}, fmt.Errorf("io.ReadAll has failed: %v", err)
 		}
 
 		if int64(len(raw)) != objSize {
-			return fmt.Errorf(
+			return []Delta{}, fmt.Errorf(
 				"object size mismatch: expected %d bytes, got %d bytes",
 				objSize, len(raw),
 			)
 		}
 
-		// Move offset by the compressed data size (difference before and after)
 		off += bytesReader.Size() - int64(bytesReader.Len())
 
 		if objType == OBJ_REF_DELTA {
-			fmt.Println(hex.EncodeToString(refDeltaHash))
+			deltas = append(deltas, Delta{
+				hash: hex.EncodeToString(refDeltaHash),
+				data: raw,
+			})
 		} else {
 			err = writeObject(raw, objTypeNames[objType])
 			if err != nil {
-				return fmt.Errorf("failed to write object: %w", err)
+				return []Delta{}, fmt.Errorf("failed to write object: %w", err)
 			}
 		}
+	}
+	return deltas, nil
+}
+
+func parseVarInt(data []byte) (int64, int8, error) {
+	var shift int8
+	var off, value int64
+	for {
+		if off >= int64(len(data)) {
+			return 0, 0, fmt.Errorf(
+				"unexpected end of data at %d",
+				off,
+			)
+		}
+		byt := data[off]
+		off++
+
+		if shift > 60 {
+			return 0, 0, fmt.Errorf(
+				"object size encoding too large at %d",
+				off-1,
+			)
+		}
+		value |= int64((int64(byt & 0x7F)) << shift)
+		shift += 7
+
+		if (byt & 0x80) == 0 {
+			break
+		}
+	}
+	return value, int8(off), nil
+}
+
+func processDeltaObjs(deltas []Delta) error {
+	for i, d := range deltas {
+		off := int64(0)
+		srcSize, read, err := parseVarInt(d.data[off:])
+		if err != nil {
+			return fmt.Errorf("failed to parse delta source size: %w", err)
+		}
+		off += int64(read)
+		_, read, err = parseVarInt(d.data[off:])
+		if err != nil {
+			return fmt.Errorf("failed to parse delta target size: %w", err)
+		}
+		off += int64(read)
+
+		content, _, err := readObject(d.hash)
+		if err != nil {
+			return err
+		}
+
+		if int64(len(content)) != srcSize {
+			return fmt.Errorf(
+				"delta source size(%d) doesn't match actual obj content size(%d)",
+				srcSize,
+				len(content),
+			)
+		}
+
 	}
 	return nil
 }
@@ -289,7 +441,7 @@ func changeDir(dirPath string) error {
 	return nil
 }
 
-func initRepo(repo, mainHash, defaultBranch string) error {
+func initRepo(mainHash, defaultBranch string) error {
 	gitDirs := []string{
 		".git",
 		".git/objects",
@@ -298,19 +450,18 @@ func initRepo(repo, mainHash, defaultBranch string) error {
 	}
 
 	for _, dir := range gitDirs {
-		fullPath := filepath.Join(repo, dir)
-		if err := os.MkdirAll(fullPath, 0755); err != nil {
-			return fmt.Errorf("failed to create %s: %w", fullPath, err)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create %s: %w", dir, err)
 		}
 	}
 
-	headPath := filepath.Join(repo, ".git", "HEAD")
+	headPath := filepath.Join(".git", "HEAD")
 	headContent := []byte(fmt.Sprintf("ref: refs/heads/%s\n", defaultBranch))
 	if err := os.WriteFile(headPath, headContent, 0644); err != nil {
 		return fmt.Errorf("failed to write to %s: %w", headPath, err)
 	}
 
-	branchPath := filepath.Join(repo, ".git", "refs", "heads", defaultBranch)
+	branchPath := filepath.Join(".git", "refs", "heads", defaultBranch)
 	branchContent := []byte(mainHash + "\n")
 	if err := os.WriteFile(branchPath, branchContent, 0644); err != nil {
 		return fmt.Errorf("failed to write to %s: %w", branchPath, err)
@@ -345,12 +496,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := initRepo(dirPath, mainHash, defaultBranch); err != nil {
+	if err := initRepo(mainHash, defaultBranch); err != nil {
 		fmt.Println("failed to init repo:", err)
 		os.Exit(1)
 	}
 
-	err = parsePackfile(pack)
+	deltas, err := parsePackfile(pack)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	// err = processDeltaObjs(deltas)
+	processDelta(deltas)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
