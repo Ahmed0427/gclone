@@ -32,41 +32,47 @@ var objTypeNames = map[byte]string{
 	OBJ_REF_DELTA: "ref_delta",
 }
 
-func getMainHash(repoURL string) (string, error) {
+func getMainHash(repoURL string) (string, string, error) {
 	refsURL := fmt.Sprintf("%s/info/refs?service=git-upload-pack", repoURL)
 
 	resp, err := http.Get(refsURL)
 	if err != nil {
-		return "", fmt.Errorf("ERROR from http.Get: %v", err)
+		return "", "", fmt.Errorf("failed to perform GET request to %s: %w",
+			refsURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return "", "", fmt.Errorf("unexpected status code %d while fetching %s",
+			resp.StatusCode, refsURL)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("ERROR from io.ReadAll: %v", err)
+		return "", "", fmt.Errorf("failed to read response body from %s: %w",
+			refsURL, err)
 	}
 
+	defaultBranch := ""
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
-		if strings.HasSuffix(line, "refs/heads/main") ||
-			strings.HasSuffix(line, "refs/heads/master") {
-			return strings.Fields(line)[0][4:], nil
+		if defaultBranch == "" {
+			words := strings.Split(line, " ")
+			for _, w := range words {
+				if strings.Contains(w, "HEAD:refs/heads") {
+					defaultBranch = strings.Split(w, "/")[2]
+				}
+			}
+		} else {
+			if strings.HasSuffix(line, fmt.Sprintf("refs/heads/%s", defaultBranch)) {
+				return strings.Fields(line)[0][4:], defaultBranch, nil
+			}
 		}
 	}
-
-	return "", fmt.Errorf("main branch ref not found")
+	return "", "", fmt.Errorf("Default branch hash not found")
 }
 
-func getPackfile(repoURL string) ([]byte, error) {
-	mainHash, err := getMainHash(repoURL)
-	if err != nil {
-		return []byte{}, err
-	}
-
+func getPackfile(repoURL, mainHash string) ([]byte, error) {
 	fetchURL := fmt.Sprintf("%s/git-upload-pack", repoURL)
 	reqBody := []byte(fmt.Sprintf("0032want %s\n", mainHash) + "0000" + "0009done\n")
 
@@ -233,7 +239,7 @@ func changeDir(dirPath string) error {
 	return nil
 }
 
-func initRepo(repo string, defaultBranch string) error {
+func initRepo(repo, mainHash, defaultBranch string) error {
 	gitDirs := []string{
 		".git",
 		".git/objects",
@@ -254,6 +260,12 @@ func initRepo(repo string, defaultBranch string) error {
 		return fmt.Errorf("failed to write HEAD file: %w", err)
 	}
 
+	branchPath := filepath.Join(repo, ".git", "refs", "heads", defaultBranch)
+	branchContent := []byte(mainHash + "\n")
+	if err := os.WriteFile(branchPath, branchContent, 0644); err != nil {
+		return fmt.Errorf("failed to write branch file: %w", err)
+	}
+
 	return nil
 }
 
@@ -271,7 +283,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	pack, err := getPackfile(repoURL)
+	mainHash, defaultBranch, err := getMainHash(repoURL)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	fmt.Println(defaultBranch, mainHash)
+
+	pack, err := getPackfile(repoURL, mainHash)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
