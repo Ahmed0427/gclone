@@ -103,6 +103,55 @@ func getPackfile(repoURL, mainHash string) ([]byte, error) {
 	return body[8:], nil
 }
 
+func compressBytes(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+
+	w := zlib.NewWriter(&buf)
+
+	_, err := w.Write(data)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func writeObject(content []byte, objType string) error {
+	// The object format is:
+	// <type> <size>\0<content>
+
+	size := len(content)
+	header := fmt.Sprintf("%s %d", objType, size)
+	objContent := append([]byte{}, []byte(header)...)
+	objContent = append(objContent, 0x00)
+	objContent = append(objContent, content...)
+
+	hasher := sha1.New()
+	hasher.Write(objContent)
+	hash := hex.EncodeToString(hasher.Sum(nil))
+
+	objDirPath := filepath.Join(".git/objects", hash[:2])
+	err := os.MkdirAll(objDirPath, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create %s: %w", objDirPath, err)
+	}
+	objPath := filepath.Join(objDirPath, hash[2:])
+
+	objContent, err = compressBytes(objContent)
+	if err != nil {
+		return fmt.Errorf("failed to compress object content: %w", err)
+	}
+
+	if err := os.WriteFile(objPath, objContent, 0644); err != nil {
+		return fmt.Errorf("failed to write to %s: %w", objPath, err)
+	}
+	return nil
+}
+
 func getObjectsCount(pack []byte) (uint32, error) {
 	if len(pack) < 12 {
 		return 0, fmt.Errorf("packfile too short: %d bytes", len(pack))
@@ -141,7 +190,6 @@ func parsePackfile(pack []byte) error {
 	pack = pack[12 : len(pack)-20]
 
 	off := int64(0)
-	counter := make(map[int]int)
 	for i := uint32(0); i < objsCount; i++ {
 		if off >= int64(len(pack)) {
 			return fmt.Errorf(
@@ -187,7 +235,9 @@ func parsePackfile(pack []byte) error {
 			}
 		}
 
+		refDeltaHash := []byte{}
 		if objType == OBJ_REF_DELTA {
+			refDeltaHash = pack[off : off+20]
 			off += 20
 		}
 
@@ -213,15 +263,15 @@ func parsePackfile(pack []byte) error {
 		// Move offset by the compressed data size (difference before and after)
 		off += bytesReader.Size() - int64(bytesReader.Len())
 
-		counter[int(objType)]++
-		if counter[int(objType)] == 1 {
-			fmt.Println("object type:", objTypeNames[objType])
-			fmt.Println(hex.Dump(raw))
-			fmt.Println()
+		if objType == OBJ_REF_DELTA {
+			fmt.Println(hex.EncodeToString(refDeltaHash))
+		} else {
+			err = writeObject(raw, objTypeNames[objType])
+			if err != nil {
+				return fmt.Errorf("failed to write object: %w", err)
+			}
 		}
 	}
-	fmt.Println(counter)
-
 	return nil
 }
 
@@ -257,13 +307,13 @@ func initRepo(repo, mainHash, defaultBranch string) error {
 	headPath := filepath.Join(repo, ".git", "HEAD")
 	headContent := []byte(fmt.Sprintf("ref: refs/heads/%s\n", defaultBranch))
 	if err := os.WriteFile(headPath, headContent, 0644); err != nil {
-		return fmt.Errorf("failed to write HEAD file: %w", err)
+		return fmt.Errorf("failed to write to %s: %w", headPath, err)
 	}
 
 	branchPath := filepath.Join(repo, ".git", "refs", "heads", defaultBranch)
 	branchContent := []byte(mainHash + "\n")
 	if err := os.WriteFile(branchPath, branchContent, 0644); err != nil {
-		return fmt.Errorf("failed to write branch file: %w", err)
+		return fmt.Errorf("failed to write to %s: %w", branchPath, err)
 	}
 
 	return nil
@@ -288,7 +338,6 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	fmt.Println(defaultBranch, mainHash)
 
 	pack, err := getPackfile(repoURL, mainHash)
 	if err != nil {
@@ -296,5 +345,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println(parsePackfile(pack))
+	if err := initRepo(dirPath, mainHash, defaultBranch); err != nil {
+		fmt.Println("failed to init repo:", err)
+		os.Exit(1)
+	}
+
+	err = parsePackfile(pack)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
