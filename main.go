@@ -38,6 +38,18 @@ type Delta struct {
 	data []byte
 }
 
+const (
+	INST_TYPE_ADD  = 0
+	INST_TYPE_COPY = 1
+)
+
+type Instruction struct {
+	instType byte
+	size     int64
+	offset   int64
+	data     []byte
+}
+
 func getMainHash(repoURL string) (string, string, error) {
 	refsURL := fmt.Sprintf("%s/info/refs?service=git-upload-pack", repoURL)
 
@@ -280,7 +292,8 @@ func parsePackfile(pack []byte) ([]Delta, error) {
 
 		objType := (byt >> 4) & 0x7
 		if _, ok := objTypeNames[objType]; !ok {
-			return []Delta{}, fmt.Errorf("Bad object type in the packfile: %d", objType)
+			return []Delta{},
+				fmt.Errorf("Bad object type in the packfile: %d", objType)
 		}
 
 		objSize := int64(byt & 0xF)
@@ -367,7 +380,7 @@ func parsePackfile(pack []byte) ([]Delta, error) {
 	return deltas, nil
 }
 
-func parseVarInt(data []byte) (int64, int8, error) {
+func parseVarInt(data []byte) (int64, int64, error) {
 	var shift int8
 	var off, value int64
 	for {
@@ -393,34 +406,116 @@ func parseVarInt(data []byte) (int64, int8, error) {
 			break
 		}
 	}
-	return value, int8(off), nil
+	return value, off, nil
 }
 
-func processDeltaObjs(deltas []Delta) error {
-	for i, d := range deltas {
+func parseInstructions(data []byte) ([]Instruction, int64) {
+	off := int64(0)
+	insts := []Instruction{}
+	for off < int64(len(data)) {
+		byt := data[off]
+		off++
+
+		inst := Instruction{}
+		if byt&0x80 != 0 {
+			inst.instType = INST_TYPE_COPY
+
+			sizeBits := (byt >> 4) & 0x7
+			offsetBits := byt & 0xF
+
+			var offset int64 = 0
+			for i := 0; i < 4; i++ {
+				if (offsetBits & (1 << i)) != 0 {
+					offset |= int64(data[off]) << (8 * i)
+					off++
+				}
+			}
+
+			var size int64 = 0
+			for i := 0; i < 3; i++ {
+				if (sizeBits & (1 << i)) != 0 {
+					size |= int64(data[off]) << (8 * i)
+					off++
+				}
+			}
+
+			if size == 0 {
+				size = 0x10000
+			}
+
+			inst.offset = offset
+			inst.size = size
+
+		} else {
+			inst.instType = INST_TYPE_ADD
+			inst.size = int64(byt & 0x7F)
+			inst.data = data[off : off+inst.size]
+			off += inst.size
+		}
+		insts = append(insts, inst)
+	}
+	return insts, off
+}
+
+func processRefDeltaObjs(deltas []Delta) error {
+	for _, d := range deltas {
 		off := int64(0)
 		srcSize, read, err := parseVarInt(d.data[off:])
 		if err != nil {
 			return fmt.Errorf("failed to parse delta source size: %w", err)
 		}
-		off += int64(read)
-		_, read, err = parseVarInt(d.data[off:])
+		off += read
+		trgSize, read, err := parseVarInt(d.data[off:])
 		if err != nil {
 			return fmt.Errorf("failed to parse delta target size: %w", err)
 		}
-		off += int64(read)
+		off += read
 
-		content, _, err := readObject(d.hash)
+		srcContent, objType, err := readObject(d.hash)
 		if err != nil {
 			return err
 		}
 
-		if int64(len(content)) != srcSize {
+		if int64(len(srcContent)) != srcSize {
 			return fmt.Errorf(
-				"delta source size(%d) doesn't match actual obj content size(%d)",
-				srcSize,
-				len(content),
+				"delta source size(%d) doesn't match source object content size(%d)",
+				srcSize, len(srcContent),
 			)
+		}
+
+		insts, read := parseInstructions(d.data[off:])
+		off += read
+
+		trgContent := []byte{}
+		for _, inst := range insts {
+			if inst.instType == INST_TYPE_COPY {
+				if inst.offset+inst.size > int64(len(srcContent)) {
+					return fmt.Errorf(
+						"instruction offset + size exceeds source content size",
+					)
+				}
+				trgContent = append(trgContent,
+					srcContent[inst.offset:inst.offset+inst.size]...)
+			} else {
+				if inst.size != int64(len(inst.data)) {
+					return fmt.Errorf(
+						"instruction size != instruction data size",
+					)
+				}
+				trgContent = append(trgContent, inst.data...)
+			}
+		}
+
+		if int64(len(trgContent)) != trgSize {
+			return fmt.Errorf(
+				"delta target size(%d) doesn't match target object content size(%d)",
+				trgSize, len(trgContent),
+			)
+		}
+
+		err = writeObject(trgContent, objType)
+		if err != nil {
+			return err
 		}
 
 	}
@@ -507,8 +602,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// err = processDeltaObjs(deltas)
-	processDelta(deltas)
+	err = processRefDeltaObjs(deltas)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
