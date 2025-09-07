@@ -565,6 +565,103 @@ func initRepo(mainHash, defaultBranch string) error {
 	return nil
 }
 
+func getTreeHashFromCommit(commitHash string) (string, error) {
+	content, objType, err := readObject(commitHash)
+	if err != nil {
+		return "", fmt.Errorf("failed to get tree hash: %w", err)
+	}
+
+	if objType != "commit" {
+		return "", fmt.Errorf("failed to get tree hash (bad type): %s", objType)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		words := strings.Split(line, " ")
+		if len(words) == 2 && words[0] == "tree" {
+			return words[1], nil
+		}
+	}
+	return "", fmt.Errorf("failed to get tree hash")
+}
+
+func checkoutGitTree(treeHash, dir string) error {
+	content, objType, err := readObject(treeHash)
+	if err != nil {
+		return fmt.Errorf("faild to checkout Git tree: %w", err)
+	}
+	if objType != "tree" {
+		return fmt.Errorf(
+			"faild to checkout Git tree: obj type is %s but it must be tree",
+			objType,
+		)
+	}
+
+	if dir != "" {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return fmt.Errorf(
+				"faild to checkout Git tree: failed to create %s: %w",
+				dir, err,
+			)
+		}
+	}
+
+	off := 0
+	for off < len(content) {
+		spaceIdx := bytes.IndexByte(content[off:], ' ')
+		modeStr := string(content[off : off+spaceIdx])
+		mode, err := strconv.ParseInt(modeStr, 8, 32)
+		if err != nil {
+			return fmt.Errorf("faild to checkout Git tree: %w", err)
+		}
+		off += spaceIdx + 1
+
+		nullIdx := bytes.IndexByte(content[off:], 0)
+		name := string(content[off : off+nullIdx])
+		off += nullIdx + 1
+
+		hash := hex.EncodeToString(content[off : off+20])
+		off += 20
+
+		npath := filepath.Join(dir, name)
+
+		if mode == 040000 {
+			if err := checkoutGitTree(hash, npath); err != nil {
+				return err
+			}
+		} else {
+			blobContent, objType, err := readObject(hash)
+			if err != nil {
+				return fmt.Errorf(
+					"faild to checkout Git tree: failed to read obj %s: %w",
+					npath, err,
+				)
+			}
+			if objType != "blob" {
+				return fmt.Errorf(
+					"faild to checkout Git tree: obj type is %s but it must be blob",
+					objType,
+				)
+			}
+
+			fileMode := os.FileMode(0644)
+			if mode == 0100755 || mode == 100755 {
+				fileMode = 0755
+			}
+
+			if err := os.WriteFile(npath, blobContent, fileMode); err != nil {
+				return fmt.Errorf(
+					"faild to checkout Git tree: failed to write to %s: %w",
+					npath, err,
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	if len(os.Args) != 3 {
 		fmt.Fprintf(os.Stderr, "%s <repo_url> <dir_path>\n", os.Args[0])
@@ -607,4 +704,12 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+
+	treeHash, err := getTreeHashFromCommit(mainHash)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	checkoutGitTree(treeHash, "")
 }
