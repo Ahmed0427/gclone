@@ -645,8 +645,8 @@ func checkoutGitTree(treeHash, dir string) error {
 				)
 			}
 
-			fileMode := os.FileMode(0644)
-			if mode == 0100755 || mode == 100755 {
+			fileMode := 0644
+			if mode == 0100755 {
 				fileMode = 0755
 			}
 
