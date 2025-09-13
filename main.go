@@ -711,5 +711,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	checkoutGitTree(treeHash, "")
+	err = checkoutGitTree(treeHash, "")
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
